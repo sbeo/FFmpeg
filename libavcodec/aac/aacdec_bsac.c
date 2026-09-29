@@ -63,6 +63,22 @@ static int bsac_hyp(int n)
     return v[n];
 }
 
+static int bsac_x(int n)
+{
+    static int v[16] = { -1000 };
+    if (v[0] == -1000) {
+        const char *e = getenv("BSAC_X");
+        for (int i = 0; i < 16; i++)
+            v[i] = 0;
+        if (e)
+            for (int i = 0; i < 16 && *e; i++) {
+                v[i] = strtol(e, (char **)&e, 10);
+                if (*e == ',') e++;
+            }
+    }
+    return v[n];
+}
+
 #define BSAC_MAX_LAYERS   128
 #define BSAC_MAX_CBANDS    32
 #define BSAC_MAX_SFB       64
@@ -540,8 +556,9 @@ static int init_layers(BSACContext *s, int header_bits)
         s->layer_start_sfb[layer] = end_sfb[g];
         s->layer_end_sfb[layer]   = s->max_sfb;
         for (int sfb = 0; sfb < s->max_sfb; sfb++) {
-            if (s->layer_end_index[layer] <= s->swb_offset[g][sfb]) {
-                s->layer_end_sfb[layer] = sfb;
+            int e = bsac_x(0) == 2 ? s->layer_end_cband[layer] * 32 : s->layer_end_index[layer];
+            if (bsac_x(0) == 4 ? e < s->swb_offset[g][sfb] : e <= s->swb_offset[g][sfb]) {
+                s->layer_end_sfb[layer] = FFMIN(sfb + (bsac_x(0) & 1), s->max_sfb);
                 break;
             }
         }
@@ -564,8 +581,13 @@ static int init_layers(BSACContext *s, int header_bits)
 
     /* bitstream offset and available length of each layer */
     for (layer = ss; layer <= nl; layer++) {
-        int64_t bitrate = s->nch * ((layer - ss) * 1000 + 16000);
-        int off = bitrate * s->frame_samples / fs / 8 * 8;
+        /* The spec rounds nch * bitrate down to whole bytes; the encoders
+         * round the per channel size, which differs by 8 bits at 48 kHz
+         * and in the upper enhancement layers at 44.1 kHz. */
+        int64_t bitrate = (layer - ss) * 1000 + 16000;
+        int off = s->nch * (bitrate * s->frame_samples / fs / 8 * 8);
+        if (bsac_x(6) == 2)
+            off = s->nch * bitrate * s->frame_samples / fs / 8 * 8;
         s->layer_bit_offset[layer] = FFMIN(off, s->frame_length * 8);
     }
     for (layer = nl - 1; layer >= ss; layer--) {
@@ -595,8 +617,27 @@ static int init_layers(BSACContext *s, int header_bits)
             if (overflow <= 0)
                 break;
         }
+    } else if (ss > 0 && bsac_x(3)) {
+        int underflow = -overflow, v = bsac_x(3);
+        int w[BSAC_MAX_LAYERS] = { 0 }, tw = 0, acc = 0;
+        for (int m = 0; m < ss; m++) {
+            w[m] = v == 1 ? 1 : v == 2 ? s->layer_si_maxlen[m] : v == 3 ? (m == 0) :
+                   v == 4 ? (m == ss - 1) : v == 5 ? ss - m : m + 1;
+            tw += w[m];
+        }
+        for (int m = 1; m < ss; m++) {
+            int share;
+            acc += w[m - 1];
+            share = tw ? (int64_t)underflow * acc / tw : 0;
+            if (v == 1 && bsac_x(4) == 1)
+                share = underflow / ss * m + FFMAX(0, m - (ss - underflow % ss));
+            s->layer_bit_offset[m] = s->layer_bit_offset[0];
+            for (int k = 0; k < m; k++)
+                s->layer_bit_offset[m] += s->layer_si_maxlen[k];
+            s->layer_bit_offset[m] += share;
+        }
     } else if (ss > 0) {
-        int underflow = -overflow;
+        int underflow = -overflow + bsac_x(5);
         for (int m = 1; m < ss; m++) {
             s->layer_bit_offset[m] = s->layer_bit_offset[m - 1] +
                                      s->layer_si_maxlen[m - 1] +
@@ -884,6 +925,12 @@ static void decode_layer_spectra(BSACContext *s, int layer)
 
     start_index[g] = s->layer_start_index[layer];
     end_index[g]   = s->layer_end_index[layer];
+    if (bsac_x(2) == 1 && layer >= s->slayer_size)
+        end_index[g] = FFMIN(s->layer_end_cband[layer] * 32, s->group_size[g]);
+    if (bsac_x(2) == 2 && layer >= s->slayer_size && s->layer_start_cband[layer] == s->layer_end_cband[layer])
+        return;
+    if (bsac_x(2) >= 3 && layer >= s->slayer_size)
+        return;
     decode_spectral_data(s, g, g + 1, start_index, end_index,
                          layer < s->slayer_size ? s->base_snf_thr : 0);
 }
@@ -892,8 +939,13 @@ static void decode_lower_spectra(BSACContext *s, int layer)
 {
     int start_index[8] = { 0 }, end_index[8] = { 0 };
 
-    for (int play = 0; play < layer; play++)
-        end_index[s->layer_group[play]] = s->layer_end_index[play];
+    if (bsac_x(1) == 1 && layer >= s->slayer_size)
+        return;
+    for (int play = 0; play < layer + (bsac_x(1) == 3 || bsac_x(2) == 4); play++)
+        end_index[s->layer_group[play]] = bsac_x(1) == 2 ? s->layer_end_cband[play] * 32 :
+                                           s->layer_end_index[play];
+    if (bsac_x(1) == 4 && layer >= s->slayer_size)
+        end_index[s->layer_group[layer]] = s->layer_start_cband[s->slayer_size] * 32;
     av_log(s->logctx, AV_LOG_DEBUG, "LOWER L%d avail %d\n", layer, s->available_len[s->cur_layer]);
     decode_spectral_data(s, 0, s->num_window_groups, start_index, end_index, 0);
     if (s->available_len[s->cur_layer] > 0)
