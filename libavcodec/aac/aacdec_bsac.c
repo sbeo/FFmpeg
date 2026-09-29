@@ -65,18 +65,24 @@ static int bsac_hyp(int n)
 
 static int bsac_x(int n)
 {
-    static int v[32] = { -1000 };
+    static int v[64] = { -1000 };
     if (v[0] == -1000) {
         const char *e = getenv("BSAC_X");
-        for (int i = 0; i < 32; i++)
+        for (int i = 0; i < 64; i++)
             v[i] = 0;
-        if (e)
-            for (int i = 0; i < 32 && *e; i++) {
-                v[i] = strtol(e, (char **)&e, 10);
-                if (*e == ',') e++;
+        for (int i = 0; e && *e && i < 64; i++) {
+            int x = strtol(e, (char **)&e, 10);
+            if (*e == '=') {
+                i = x;
+                e++;
+                x = strtol(e, (char **)&e, 10);
             }
+            if (i >= 0 && i < 64)
+                v[i] = x;
+            if (*e == ',') e++;
+        }
     }
-    return v[n];
+    return n >= 0 && n < 64 ? v[n] : 0;
 }
 
 #define BSAC_MAX_LAYERS   128
@@ -422,6 +428,10 @@ static int decode_general_header(AACDecContext *ac, BSACContext *s,
         }
     }
 
+    av_log(s->logctx, AV_LOG_DEBUG, "GHDR ws %d kb %d max_sfb %d ngr %d pns %d/%d ms %d tns %d%d bits %d\n",
+           ics->window_sequence[0], ics->use_kb_window[0], ics->max_sfb, ics->num_window_groups,
+           s->pns_data_present, s->pns_start_sfb, s->ms_mask_present,
+           che->ch[0].tns.present, s->nch == 2 ? che->ch[1].tns.present : 0, get_bits_count(gb));
     s->window_sequence   = ics->window_sequence[0];
     s->max_sfb           = ics->max_sfb;
     s->num_window_groups = ics->num_window_groups;
@@ -516,7 +526,7 @@ static int init_layers(BSACContext *s, int header_bits)
 {
     const int is_short = s->window_sequence == EIGHT_SHORT_SEQUENCE;
     const int fs = s->fs;
-    int end_index[8], end_cband[8], last_index[8], end_sfb[8];
+    int end_index[8], end_cband[8], last_index[8], end_sfb[8], base_end[8];
     int ss = 0, nl, layer;
     int overflow;
 
@@ -536,8 +546,10 @@ static int init_layers(BSACContext *s, int header_bits)
                 e = e / 64 * 64;
             }
             end_cband[g] = (e + 31) / 32;
+            base_end[g]  = e;
         } else {
             end_cband[g] = s->base_band;
+            base_end[g]  = end_cband[g] * 32;
         }
         ss += end_cband[g];
     }
@@ -573,7 +585,13 @@ static int init_layers(BSACContext *s, int header_bits)
             s->layer_end_index[layer]   = (cband + 1) * 32;
             layer++;
         }
-        end_index[g]  = end_cband[g] * 32;
+        /* The spec ends the last base layer of a group at its coding band
+         * boundary, which makes the rounding of the short window base band
+         * above pointless; the encoders end it at the rounded base band and
+         * continue from there in the enhancement layers. */
+        end_index[g] = base_end[g];
+        if (layer > 0)
+            s->layer_end_index[layer - 1] = base_end[g];
         last_index[g] = s->swb_offset[g][s->max_sfb];
     }
     for (layer = ss; layer < nl; layer++) {
@@ -595,12 +613,14 @@ static int init_layers(BSACContext *s, int header_bits)
         s->layer_start_sfb[layer] = end_sfb[g];
         s->layer_end_sfb[layer]   = s->max_sfb;
         for (int sfb = 0; sfb < s->max_sfb; sfb++) {
-            /* The encoders send the side info of every scalefactor band
-             * starting inside the coding band where the layer ends, not
-             * only of those starting before layer_end_index. */
-            int e = bsac_x(0) == 3 ? s->layer_end_index[layer] : s->layer_end_cband[layer] * 32;
-            if (bsac_x(0) == 4 ? e < s->swb_offset[g][sfb] : e <= s->swb_offset[g][sfb]) {
-                s->layer_end_sfb[layer] = FFMIN(sfb + (bsac_x(0) & 1), s->max_sfb);
+            /* The spec sends the side info of the scalefactor bands starting
+             * before layer_end_index plus one more. The encoders send those
+             * starting before layer_end_index in short windows, and those
+             * starting inside the coding band where the layer ends in long
+             * windows. */
+            int e = is_short ? s->layer_end_index[layer] : s->layer_end_cband[layer] * 32;
+            if (e <= s->swb_offset[g][sfb]) {
+                s->layer_end_sfb[layer] = sfb;
                 break;
             }
         }
@@ -628,15 +648,13 @@ static int init_layers(BSACContext *s, int header_bits)
          * and in the upper enhancement layers at 44.1 kHz. */
         int64_t bitrate = (layer - ss) * 1000 + 16000;
         int off = s->nch * (bitrate * s->frame_samples / fs / 8 * 8);
-        if (bsac_x(6) == 2)
-            off = s->nch * bitrate * s->frame_samples / fs / 8 * 8;
         s->layer_bit_offset[layer] = FFMIN(off, s->frame_length * 8);
     }
-    for (layer = nl - 1; layer >= ss; layer--) {
-        int off = s->layer_bit_offset[layer + 1] - s->layer_si_maxlen[layer];
-        if (off < s->layer_bit_offset[layer])
-            s->layer_bit_offset[layer] = off;
-    }
+    /* The spec clips the top layer to its nominal size and moves the start
+     * of every enhancement layer down so that its side info fits before the
+     * next one. The encoders let the top layer run to the end of the frame
+     * and keep the nominal starts. */
+    s->layer_bit_offset[nl] = s->frame_length * 8;
     for (layer = ss - 1; layer >= 0; layer--)
         s->layer_bit_offset[layer] = s->layer_bit_offset[layer + 1] -
                                      s->layer_si_maxlen[layer];
@@ -658,6 +676,15 @@ static int init_layers(BSACContext *s, int header_bits)
                 s->layer_bit_offset[m] += size;
             if (overflow <= 0)
                 break;
+        }
+        /* Not specified: when the enhancement layers cannot take all of
+         * it, the rest comes from the upper base layers. */
+        for (layer = ss - 1; layer >= 1 && overflow > 0; layer--) {
+            int size = s->layer_bit_offset[layer + 1] - s->layer_bit_offset[layer];
+            size = FFMIN(FFMAX(size, 0), overflow);
+            overflow -= size;
+            for (int m = 1; m <= layer; m++)
+                s->layer_bit_offset[m] += size;
         }
     } else if (ss > 0 && bsac_x(3)) {
         int underflow = -overflow, v = bsac_x(3);
@@ -1347,9 +1374,11 @@ int ff_aac_bsac_decode_frame(AACDecContext *ac, ChannelElement *che,
     if (s->ms_mask_present && s->nch != 2)
         return AVERROR_INVALIDDATA;
 
+    /* Some encoders always write header_length 0; the parsed length is
+     * used instead. */
     header_bits = get_bits_count(&gb);
     if (s->header_length < 15 && header_bits != (s->header_length + 7) * 8)
-        av_log(s->logctx, AV_LOG_WARNING, "BSAC header length mismatch: %d != %d\n",
+        av_log(s->logctx, AV_LOG_DEBUG, "BSAC header length mismatch: %d != %d\n",
                header_bits >> 3, s->header_length + 7);
 
     init_bands(s, &che->ch[0].ics);
@@ -1388,6 +1417,13 @@ int ff_aac_bsac_decode_frame(AACDecContext *ac, ChannelElement *che,
                     }
                 }
         static int fcnt;
+        int even = 0, odd = 0;
+        for (int ch = 0; ch < s->nch; ch++)
+            for (int c = 1; c * 32 < s->group_size[0]; c++) {
+                even += s->cband_si[ch][0][c] && !(s->cband_si[ch][0][c] & 1);
+                odd  += s->cband_si[ch][0][c] & 1;
+            }
+        av_log(s->logctx, AV_LOG_DEBUG, "PARITY %d %d\n", odd, even);
         av_log(s->logctx, AV_LOG_DEBUG, "FRAME %d\n", fcnt++);
         av_log(s->logctx, AV_LOG_DEBUG, "MSBCHECK ok %d bad %d ms %d tns %d%d scfm %d%d%d%d hl %d\n", ok, bad, s->ms_mask_present, che->ch[0].tns.present, che->ch[1].tns.present, s->base_scf_model[0], s->enh_scf_model[0], s->base_scf_model[1], s->enh_scf_model[1], s->header_length);
     }
