@@ -595,7 +595,10 @@ static int init_layers(BSACContext *s, int header_bits)
         s->layer_start_sfb[layer] = end_sfb[g];
         s->layer_end_sfb[layer]   = s->max_sfb;
         for (int sfb = 0; sfb < s->max_sfb; sfb++) {
-            int e = bsac_x(0) == 2 ? s->layer_end_cband[layer] * 32 : s->layer_end_index[layer];
+            /* The encoders send the side info of every scalefactor band
+             * starting inside the coding band where the layer ends, not
+             * only of those starting before layer_end_index. */
+            int e = bsac_x(0) == 3 ? s->layer_end_index[layer] : s->layer_end_cband[layer] * 32;
             if (bsac_x(0) == 4 ? e < s->swb_offset[g][sfb] : e <= s->swb_offset[g][sfb]) {
                 s->layer_end_sfb[layer] = FFMIN(sfb + (bsac_x(0) & 1), s->max_sfb);
                 break;
@@ -610,8 +613,8 @@ static int init_layers(BSACContext *s, int header_bits)
         for (int cband = s->layer_start_cband[layer];
              cband < s->layer_end_cband[layer]; cband++)
             for (int ch = 0; ch < s->nch; ch++)
-                len += cband ? ff_bsac_cband_si_type[s->cband_si_type[ch]].max_cband_si_len
-                             : 11;
+                len += cband || (bsac_x(24) && s->layer_group[layer]) ?
+                       ff_bsac_cband_si_type[s->cband_si_type[ch]].max_cband_si_len : 11;
         for (int sfb = s->layer_start_sfb[layer]; sfb < s->layer_end_sfb[layer]; sfb++)
             for (int ch = 0; ch < s->nch; ch++)
                 len += s->max_sfb_si_len[ch] + 5;
@@ -690,8 +693,8 @@ static int init_layers(BSACContext *s, int header_bits)
     for (layer = 0; layer < nl; layer++)
         s->available_len[layer] = s->layer_bit_offset[layer + 1] -
                                   s->layer_bit_offset[layer];
-    av_log(s->logctx, AV_LOG_DEBUG, "LAYINFO ov %d si0 %d si1 %d av0 %d av1 %d cst %d %d msl %d %d\n", overflow,
-           s->layer_si_maxlen[0], s->layer_si_maxlen[1], s->available_len[0], s->available_len[1],
+    av_log(s->logctx, AV_LOG_DEBUG, "LAYINFO ws %d ngr %d ss %d ov %d si0 %d si1 %d av0 %d av1 %d cst %d %d msl %d %d\n",
+           s->window_sequence, s->num_window_groups, ss, overflow, s->layer_si_maxlen[0], s->layer_si_maxlen[1], s->available_len[0], s->available_len[1],
            s->cband_si_type[0], s->cband_si_type[1], s->max_sfb_si_len[0], s->max_sfb_si_len[1]);
     s->available_len[0] += bsac_hyp(5);
     {
@@ -742,7 +745,7 @@ static int decode_layer_cband_si(BSACContext *s, int layer)
         const BSACCbandSiType *type = &ff_bsac_cband_si_type[s->cband_si_type[ch]];
         for (int cband = s->layer_start_cband[layer];
              cband < s->layer_end_cband[layer]; cband++) {
-            int first = !cband;
+            int first = !cband && (!g || bsac_x(22) != 1);
             const uint16_t *model = !first ? ff_bsac_cband_si_models[type->model]
                                            : ff_bsac_cband_si_cband0_model;
             int largest = !first ? type->largest_cband_si : type->largest_cband0_si;
@@ -771,6 +774,9 @@ static int decode_layer_cband_si(BSACContext *s, int layer)
                 msb = 0;
             start = s->group_offset[g] + cband * 32;
             end   = s->group_offset[g] + FFMIN((cband + 1) * 32, s->group_size[g]);
+            /* Lines above max_sfb are not coded. */
+            if (bsac_x(23) != 1)
+                end = FFMIN(end, s->group_offset[g] + s->swb_offset[g][s->max_sfb]);
             for (int i = start; i < end; i++)
                 s->cur_snf[ch][i] = msb;
         }
@@ -1384,6 +1390,18 @@ int ff_aac_bsac_decode_frame(AACDecContext *ac, ChannelElement *che,
         static int fcnt;
         av_log(s->logctx, AV_LOG_DEBUG, "FRAME %d\n", fcnt++);
         av_log(s->logctx, AV_LOG_DEBUG, "MSBCHECK ok %d bad %d ms %d tns %d%d scfm %d%d%d%d hl %d\n", ok, bad, s->ms_mask_present, che->ch[0].tns.present, che->ch[1].tns.present, s->base_scf_model[0], s->enh_scf_model[0], s->base_scf_model[1], s->enh_scf_model[1], s->header_length);
+    }
+    if (av_log_get_level() >= AV_LOG_TRACE && s->window_sequence == EIGHT_SHORT_SEQUENCE) {
+        for (int ch = 0; ch < s->nch; ch++) {
+            char line[1024];
+            int n = snprintf(line, sizeof(line), "SHORT ch%d ss %d max_sfb %d bb %d:", ch, s->slayer_size, s->max_sfb, s->base_band);
+            for (int g = 0; g < s->num_window_groups; g++) {
+                n += snprintf(line + n, sizeof(line) - n, " | g%d(%d)", g, s->window_group_length[g]);
+                for (int c = 0; c * 32 < s->group_size[g]; c++)
+                    n += snprintf(line + n, sizeof(line) - n, " %d", s->cband_si[ch][g][c]);
+            }
+            av_log(s->logctx, AV_LOG_TRACE, "%s\n", line);
+        }
     }
     if (av_log_get_level() >= AV_LOG_TRACE) {
         for (int ch = 0; ch < s->nch; ch++) {
