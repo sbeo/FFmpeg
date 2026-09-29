@@ -65,13 +65,13 @@ static int bsac_hyp(int n)
 
 static int bsac_x(int n)
 {
-    static int v[16] = { -1000 };
+    static int v[32] = { -1000 };
     if (v[0] == -1000) {
         const char *e = getenv("BSAC_X");
-        for (int i = 0; i < 16; i++)
+        for (int i = 0; i < 32; i++)
             v[i] = 0;
         if (e)
-            for (int i = 0; i < 16 && *e; i++) {
+            for (int i = 0; i < 32 && *e; i++) {
                 v[i] = strtol(e, (char **)&e, 10);
                 if (*e == ',') e++;
             }
@@ -176,6 +176,7 @@ typedef struct BSACContext {
 
     int l0_min_snf[2];
     int sign_bit;
+    int enh_sym_count;
     int warned_pns;
     int warned_is;
 } BSACContext;
@@ -237,6 +238,8 @@ static int ar_decode_symbol(BSACArith *ar, const uint16_t *cum_freq)
     int sym;
 
     ar_renorm_in(ar);
+    if (!ar->range)
+        return 0;
     cum = ar->value / ar->range;
     for (sym = 0; cum_freq[sym] > cum; sym++)
         ;
@@ -251,6 +254,7 @@ static int ar_decode_bit(BSACArith *ar, int p0)
 {
     int bit;
 
+    p0 = av_clip(p0, 1, BSAC_ONE - 1);
     ar_renorm_in(ar);
     if (p0 * ar->range <= ar->value) {
         bit = 1;
@@ -273,9 +277,28 @@ static int ar_cost(BSACContext *s, int before)
     return before;
 }
 
+static int perturb_count;
+static int perturb(BSACContext *s, int is_bit)
+{
+    if (!bsac_x(7) || s->cur_layer < s->slayer_size)
+        return 0;
+    if (perturb_count++ != bsac_x(8))
+        return 0;
+    return bsac_x(7);
+}
+
+static int decode_bit(BSACContext *s, int p0);
+
 static int decode_symbol(BSACContext *s, const uint16_t *model)
 {
     int before = s->ar.est_cw_len;
+    int pm = perturb(s, 0);
+    if (pm == 2) {
+        int before2 = s->ar.est_cw_len;
+        ar_decode_bit(&s->ar, BSAC_P0_SIGN);
+        s->available_len[s->cur_layer] -= ar_cost(s, before2);
+        before = s->ar.est_cw_len;
+    }
     int sym = ar_decode_symbol(&s->ar, model);
     if (bsac_hyp(11) != 1)
         s->available_len[s->cur_layer] -= ar_cost(s, before);
@@ -286,6 +309,15 @@ static int decode_bit(BSACContext *s, int p0)
 {
     int *avail = &s->available_len[s->cur_layer];
     int bit;
+    int pm = perturb(s, 1);
+
+    if (pm == 1)
+        return 0;
+    if (pm == 2) {
+        int before2 = s->ar.est_cw_len;
+        ar_decode_bit(&s->ar, BSAC_P0_SIGN);
+        *avail -= ar_cost(s, before2);
+    }
 
     {
         int a = *avail + bsac_hyp(15);
@@ -456,6 +488,10 @@ static void init_bands(BSACContext *s, const IndividualChannelStream *ics)
 
 static int layer_inc(int fs, int end_index)
 {
+    if (bsac_x(21) == 1)
+        return end_index % 32 == 24 ? 8 : 12;
+    if (bsac_x(21) == 2)
+        return end_index % 32 == 12 ? 8 : 12;
     switch (bsac_hyp(12)) {
     case 1: return end_index % 32 ? 8 : 12;
     case 2: return 16;
@@ -463,8 +499,11 @@ static int layer_inc(int fs, int end_index)
     case 4: return 12;
     case 5: return 32;
     }
+    /* The spec adds 8 at a coding band boundary and 12 otherwise (8/12/12
+     * lines per band); the encoders add 12 without crossing the band
+     * boundary (12/12/8). */
     if (fs == 44100 || fs == 48000)
-        return end_index % 32 ? 12 : 8;
+        return bsac_x(21) == 3 ? (end_index % 32 ? 12 : 8) : FFMIN(12, 32 - end_index % 32);
     if (fs == 22050 || fs == 24000 || fs == 32000)
         return 16;
     if (fs == 11025 || fs == 12000 || fs == 16000)
@@ -682,6 +721,23 @@ static int decode_layer_cband_si(BSACContext *s, int layer)
 {
     const int g = s->layer_group[layer];
 
+    if (bsac_x(18) && layer >= s->slayer_size &&
+        s->layer_start_cband[layer] == s->layer_end_cband[layer]) {
+        int cband = s->layer_end_cband[layer] - 1;
+        for (int ch = 0; ch < s->nch; ch++) {
+            const BSACCbandSiType *type = &ff_bsac_cband_si_type[s->cband_si_type[ch]];
+            if (bsac_x(18) == 2 && !s->cband_si[ch][g][cband])
+                continue;
+            if (bsac_x(18) == 3 && !s->cband_si[0][g][cband] && !s->cband_si[1][g][cband])
+                continue;
+            {
+                int si = decode_symbol(s, ff_bsac_cband_si_models[type->model]);
+                if (bsac_x(19))
+                    s->cband_si[ch][g][cband] = si;
+            }
+        }
+    }
+
     for (int ch = 0; ch < s->nch; ch++) {
         const BSACCbandSiType *type = &ff_bsac_cband_si_type[s->cband_si_type[ch]];
         for (int cband = s->layer_start_cband[layer];
@@ -709,6 +765,10 @@ static int decode_layer_cband_si(BSACContext *s, int layer)
 
             /* Set the current significance of the whole coding band. */
             msb   = si ? ff_bsac_prob_tables[si].msb : 0;
+            if (si && layer >= s->slayer_size)
+                msb = FFMAX(msb + bsac_x(13), 1);
+            if (bsac_x(14) && layer >= s->slayer_size)
+                msb = 0;
             start = s->group_offset[g] + cband * 32;
             end   = s->group_offset[g] + FFMIN((cband + 1) * 32, s->group_size[g]);
             for (int i = start; i < end; i++)
@@ -820,11 +880,31 @@ static int decode_layer_sfb_si(BSACContext *s, int layer)
 /* ---------------------------------------------------------------------- */
 /* Bit-sliced spectral data, subclause 4.6.4.2                             */
 
+static int sliced_bit_p0_(const BSACContext *s, int ch, int g, int i, int snf);
 static int sliced_bit_p0(const BSACContext *s, int ch, int g, int i, int snf)
+{
+    int m = bsac_x(11);
+    if (m && i >= s->layer_start_index[s->slayer_size] && (s->cur_layer < s->slayer_size + 3 || bsac_x(12))) {
+        const BSACProbTable *pt = &ff_bsac_prob_tables[s->cband_si[ch][g][i >> 5]];
+        switch (m) {
+        case 1: return pt->zero[FFMIN(pt->msb - snf, pt->nb_levels - 1)][0];
+        case 3: return BSAC_P0_SIGN;
+        case 2: {
+            BSACContext t = *s;
+            return sliced_bit_p0_(&t, ch, g, i, snf);
+        }
+        }
+    }
+    return sliced_bit_p0_(s, ch, g, i, snf);
+}
+
+static int sliced_bit_p0_(const BSACContext *s, int ch, int g, int i, int snf)
 {
     const int32_t *smp = s->sample[ch] + s->group_offset[g];
     const BSACProbTable *pt = &ff_bsac_prob_tables[s->cband_si[ch][g][i >> 5]];
-    int level = FFMIN(pt->msb - snf, pt->nb_levels - 1);
+    if (bsac_x(15) && i >= s->layer_start_index[s->slayer_size])
+        pt = &ff_bsac_prob_tables[bsac_x(15)];
+    int level = av_clip(pt->msb - snf, 0, pt->nb_levels - 1);
     int higher = FFABS(smp[i]) >> snf;
     const int v = bsac_hyp(10);
 
@@ -861,6 +941,39 @@ static int sliced_bit_p0(const BSACContext *s, int ch, int g, int i, int snf)
     }
 }
 
+static int spectral_step(BSACContext *s, int ch, int g, int i, int snf)
+{
+    const int k = s->group_offset[g] + i;
+    int32_t *smp = &s->sample[ch][k];
+
+    if (s->cur_snf[ch][k] < snf)
+        return 0;
+
+    if (!*smp || s->sign_is_coded[ch][k]) {
+        if (s->cur_layer >= 10 && s->cur_layer <= 12 && av_log_get_level() >= AV_LOG_TRACE)
+            av_log(s->logctx, AV_LOG_TRACE, "SYM L%d snf %d i %d ch %d p0 %04x avail %d\n", s->cur_layer, snf, i, ch, sliced_bit_p0(s, ch, g, i, snf), s->available_len[s->cur_layer]);
+        int p0 = sliced_bit_p0(s, ch, g, i, snf);
+        if (bsac_x(16) && s->cur_layer >= s->slayer_size && i >= s->layer_start_index[s->slayer_size] &&
+            s->enh_sym_count++ == bsac_x(17))
+            p0 = bsac_x(16) << 8;
+        if (decode_bit(s, p0)) {
+            int32_t bit = 1 << (snf - 1);
+            *smp += *smp < 0 ? -bit : bit;
+        }
+    }
+    if (*smp && !s->sign_is_coded[ch][k]) {
+        if (!layer_data_available(s))
+            return 1;
+        s->sign_bit = 1;
+        if (decode_bit(s, BSAC_P0_SIGN))
+            *smp = -*smp;
+        s->sign_bit = 0;
+        s->sign_is_coded[ch][k] = 1;
+    }
+    s->cur_snf[ch][k]--;
+    return !layer_data_available(s);
+}
+
 static void decode_spectral_data(BSACContext *s, int start_g, int end_g,
                                  const int *start_index, const int *end_index,
                                  int thr_snf)
@@ -878,42 +991,29 @@ static void decode_spectral_data(BSACContext *s, int start_g, int end_g,
     if (maxsnf <= thr_snf && av_log_get_level() >= AV_LOG_DEBUG)
         av_log(s->logctx, AV_LOG_DEBUG, "EXHAUST L%d avail %d range %d-%d\n", s->cur_layer,
                s->available_len[s->cur_layer], start_g, end_g);
-    for (int snf = maxsnf; snf > thr_snf; snf--) {
-        for (int g = start_g; g < end_g; g++) {
-            for (int i = start_index[g]; i < end_index[g]; i++) {
-                for (int ch = 0; ch < s->nch; ch++) {
-                    const int k = s->group_offset[g] + i;
-                    int32_t *smp = &s->sample[ch][k];
-
-                    if (s->cur_snf[ch][k] < snf)
-                        continue;
-
-                    if (!*smp || s->sign_is_coded[ch][k]) {
-                        if (s->cur_layer >= 10 && s->cur_layer <= 12 && av_log_get_level() >= AV_LOG_TRACE)
-                            av_log(s->logctx, AV_LOG_TRACE, "SYM L%d snf %d i %d ch %d p0 %04x avail %d\n", s->cur_layer, snf, i, ch, sliced_bit_p0(s, ch, g, i, snf), s->available_len[s->cur_layer]);
-                        if (decode_bit(s, sliced_bit_p0(s, ch, g, i, snf))) {
-                            int32_t bit = 1 << (snf - 1);
-                            *smp += *smp < 0 ? -bit : bit;
-                        }
-                    }
-                    if (*smp && !s->sign_is_coded[ch][k]) {
-                        if (!layer_data_available(s)) {
-                            if (s->cur_layer == 0) av_log(s->logctx, AV_LOG_DEBUG, "STOP sign avail %d\n", s->available_len[0]);
-                            return;
-                        }
-                        s->sign_bit = 1;
-                        if (decode_bit(s, BSAC_P0_SIGN))
-                            *smp = -*smp;
-                        s->sign_bit = 0;
-                        s->sign_is_coded[ch][k] = 1;
-                    }
-                    s->cur_snf[ch][k]--;
-                    if (!layer_data_available(s)) {
-                        if (s->cur_layer == 0) av_log(s->logctx, AV_LOG_DEBUG, "STOP bit avail %d\n", s->available_len[0]);
-                        return;
-                    }
-                }
-            }
+    {
+        int ord = s->cur_layer >= s->slayer_size ? bsac_x(9) : 0;
+        if (ord == 0) {
+            for (int snf = maxsnf; snf > thr_snf; snf--)
+                for (int g = start_g; g < end_g; g++)
+                    for (int i = start_index[g]; i < end_index[g]; i++)
+                        for (int ch = 0; ch < s->nch; ch++)
+                            if (spectral_step(s, ch, g, i, snf))
+                                return;
+        } else if (ord == 1) {
+            for (int snf = maxsnf; snf > thr_snf; snf--)
+                for (int g = start_g; g < end_g; g++)
+                    for (int ch = 0; ch < s->nch; ch++)
+                        for (int i = start_index[g]; i < end_index[g]; i++)
+                            if (spectral_step(s, ch, g, i, snf))
+                                return;
+        } else {
+            for (int ch = 0; ch < s->nch; ch++)
+                for (int snf = maxsnf; snf > thr_snf; snf--)
+                    for (int g = start_g; g < end_g; g++)
+                        for (int i = start_index[g]; i < end_index[g]; i++)
+                            if (spectral_step(s, ch, g, i, snf))
+                                return;
         }
     }
 }
@@ -971,9 +1071,27 @@ static int decode_layer_element(BSACContext *s, int layer)
     s->cur_layer = layer;
     if ((ret = decode_layer_cband_si(s, layer)) < 0)
         return ret;
+    if (bsac_x(20) && layer >= s->slayer_size) {
+        decode_layer_spectra(s, layer);
+        if (bsac_x(20) == 1 && (ret = decode_layer_sfb_si(s, layer)) < 0)
+            return ret;
+        decode_lower_spectra(s, layer);
+        if (bsac_x(20) == 2 && (ret = decode_layer_sfb_si(s, layer)) < 0)
+            return ret;
+        return 0;
+    }
     if ((ret = decode_layer_sfb_si(s, layer)) < 0)
         return ret;
 
+    if (bsac_x(10) == 1 && layer >= s->slayer_size) {
+        decode_lower_spectra(s, layer);
+        decode_layer_spectra(s, layer);
+        return 0;
+    }
+    if (bsac_x(10) == 2 && layer >= s->slayer_size) {
+        decode_layer_spectra(s, layer);
+        return 0;
+    }
     decode_layer_spectra(s, layer);
     if (!s->sba_mode) {
         decode_lower_spectra(s, layer);
@@ -1230,6 +1348,8 @@ int ff_aac_bsac_decode_frame(AACDecContext *ac, ChannelElement *che,
 
     init_bands(s, &che->ch[0].ics);
     reset_frame_state(s);
+    perturb_count = 0;
+    s->enh_sym_count = 0;
     ret = init_layers(s, header_bits);
     if (ret < 0)
         return ret;
