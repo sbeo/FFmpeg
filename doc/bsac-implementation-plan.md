@@ -119,7 +119,11 @@ bsac_raw_data_block
 | E12 | 4.6.4.3 | `ms_mask_present==3`, `stereo_info==3`, 두 noise flag가 0 → out-of-phase IS. `sfb < pns_start_sfb`일 때 noise flag 자체를 읽지 않음 | 구문표(Table 4.39)를 기준으로 구현 |
 | E13 | 4.5.2.6.2.5 `available_len` | "산술부호가 레이어 시작에서 초기화되었으면 1을 뺀다" — SBA에서 segment 시작 레이어에만 해당 | SBA가 아니면 layer 0에만 적용 |
 | E14 | 4.5.2.6.2.5 `layer_end_sfb` | `if (layer_end_index <= swb_offset[sfb]) layer_end_sfb = sfb + 1` | **샘플로 확인: `+ 1`이 오류.** 레이어 끝 이후에서 시작하는 band는 포함하지 않음 (`layer_end_sfb = sfb`). `+ 1`이면 레이어 0의 scf 심볼 수가 어긋나 c0부터 깨짐 |
-| E15 | Table 4.39 vs 4.B.17.5 | 규범 구문은 모든 sfb에 `acode_scf_index`를 두지만, 정보성 부록은 "값이 모두 0인 sfb의 scalefactor는 전송하지 않는다", "첫 scf만 max 기준, 나머지는 직전 scf 기준 차분"이라고 기술 | 샘플로 검증 중 |
+| E15 | Table 4.39 vs 4.B.17.5 | 규범 구문은 모든 sfb에 `acode_scf_index`를 두지만, 정보성 부록은 "값이 모두 0인 sfb의 scalefactor는 전송하지 않는다", "첫 scf만 max 기준, 나머지는 직전 scf 기준 차분"이라고 기술 | **샘플로 확인: 부록 설명이 틀림.** 기본 레이어에서 0 대역 scf를 건너뛰면 c9·c10부터 깨지고, 확장 레이어에서만 건너뛰어도 개선 없음. 규범 구문(모든 sfb 전송, 모두 `max_scalefactor` 기준 차분)이 맞음 |
+| E16 | 4.5.2.6.2.5 / E13 | 산술부호 초기화 레이어에서 `available_len`에서 1을 뺀다 | **샘플로 확인: 빼지 않아야 함.** 빼면 레이어 0 끝이 1비트 어긋나 c1부터 깨짐 |
+| E17 | 4.6.4.2.3 `min_p0`/`max_p0` | `available_len < 14`이면 p0를 Table 4.A.35/36 범위로 제한 | **샘플로 확인: 제한하지 않아야 함.** 인덱스를 ±1 옮기거나 부호 비트만 빼는 변형도 모두 악화. 이 인코더는 제한을 쓰지 않는 것으로 보임 |
+| E18 | 4.5.2.6.2.2.12 | "남은 비트가 있으면(redundant bits) 다음 레이어 `available_len`에 더한다" — 음수(초과 사용)는 언급 없음 | **샘플로 확인: 음수도 그대로 넘겨야 함.** 전체 비트 수가 보존됨 |
+| E19 | 4.5.2.6.2.5 `layer_bit_offset` | `floor(bitrate·1024/fs/8)·8` | 레이어 0~13 시작점은 이 공식과 일치. 레이어 16 시작점은 8비트 앞당기면 c12 성공률이 0.24→0.53으로 오름 (원인 미확정, 조사 중) |
 
 ### 3.1 T-DMB 샘플(KBS)로 확인한 사실
 
@@ -130,6 +134,14 @@ bsac_raw_data_block
 - 검증 지표
   1. 각 coding band의 MSB plane에는 1이 적어도 하나 있어야 함 (`cband_si`가 가리키는 MSB와 실제 최댓값 비교)
   2. 각 `cband_si` 심볼 비용 ≤ `max_cband_si_len`(0번 band는 11), 각 sfb side info 비용 ≤ `max_sfb_si_len + 5`
+  3. **(가장 강력)** 이 인코더는 홀수 `cband_si`(확률표 1,3,5,7,9 계열)만 사용함. 0 또는 홀수가 아니면
+     그 cband는 동기를 잃은 것. 동기를 잃은 복호는 모든 cband에서 똑같은 분포(짝수 60% 이상)를 보임
+- TS에는 TEI·연속성 카운터 오류가 없고, 오류율은 파일 전 구간에 고르게 분포 (초반 집중 아님)
+- `base_scf_model`=0(scf 전송 없음)인 프레임과 `max_sfb_si_len`=0이 흔함. scf는 대부분 `max_scalefactor`와 같음
+- 레이어 0 예산은 약 126비트로 c0의 상위 2~3개 평면만 담김. `bsac_lower_spectra`는 기본 레이어 1~4에서는
+  거의 실행되지 않고(예산이 새 cband에서 소진), 레이어 10 이후에는 거의 매번 실행됨
+- 현재 상태(E14·E16·E17·E18 반영): c0~c9의 MSB 검사 불량 0%, `cband_si` 분포 정상.
+  c10은 `cband_si`까지 맞음. c10에 값이 있으면 레이어 10~12에서, c10이 비어 있어도 레이어 13~15에서 동기를 잃음
 
 ---
 
