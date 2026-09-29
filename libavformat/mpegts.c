@@ -98,6 +98,7 @@ typedef struct MpegTSSectionFilter {
     unsigned int end_of_section_reached : 1;
     SectionCallback *section_cb;
     void *opaque;
+    SLConfigDescr sl;               ///< SL packet header of ISO/IEC 14496 sections
 } MpegTSSectionFilter;
 
 struct MpegTSFilter {
@@ -267,6 +268,12 @@ enum MpegTSState {
 #define PES_HEADER_SIZE 9
 #define MAX_PES_HEADER_SIZE (9 + 255)
 
+enum {
+    SL_CONFIG_UNKNOWN,      ///< no SL config, none expected
+    SL_CONFIG_PENDING,      ///< SL config expected from the object descriptor stream
+    SL_CONFIG_SET,
+};
+
 typedef struct PESContext {
     int pid;
     int pcr_pid; /**< if -1 then all packets containing PCR are considered */
@@ -288,6 +295,7 @@ typedef struct PESContext {
     uint8_t header[MAX_PES_HEADER_SIZE];
     AVBufferRef *buffer;
     SLConfigDescr sl;
+    int sl_state;           ///< SL_CONFIG_*
     int merged_st;
 } PESContext;
 
@@ -1137,20 +1145,31 @@ static uint64_t get_ts64(GetBitContext *gb, int bits)
     return get_bits64(gb, bits);
 }
 
-static int read_sl_header(PESContext *pes, SLConfigDescr *sl,
-                          const uint8_t *buf, int buf_size)
+typedef struct SLHeader {
+    int au_start;
+    int64_t dts, cts;
+} SLHeader;
+
+/**
+ * Parse an SL packet header (ISO/IEC 14496-1 10.2.4).
+ * @return the size of the header in bytes
+ */
+static int parse_sl_header(const SLConfigDescr *sl, SLHeader *h,
+                           const uint8_t *buf, int buf_size)
 {
     GetBitContext gb;
     int au_start_flag = 0, au_end_flag = 0, ocr_flag = 0, idle_flag = 0;
     int padding_flag = 0, padding_bits = 0, inst_bitrate_flag = 0;
     int dts_flag = -1, cts_flag = -1;
-    int64_t dts = AV_NOPTS_VALUE, cts = AV_NOPTS_VALUE;
     uint8_t buf_padded[128 + AV_INPUT_BUFFER_PADDING_SIZE];
     int buf_padded_size = FFMIN(buf_size, sizeof(buf_padded) - AV_INPUT_BUFFER_PADDING_SIZE);
 
     memcpy(buf_padded, buf, buf_padded_size);
+    memset(buf_padded + buf_padded_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 
     init_get_bits(&gb, buf_padded, buf_padded_size * 8);
+
+    h->dts = h->cts = AV_NOPTS_VALUE;
 
     if (sl->use_au_start)
         au_start_flag = get_bits1(&gb);
@@ -1188,24 +1207,40 @@ static int read_sl_header(PESContext *pes, SLConfigDescr *sl,
         if (sl->inst_bitrate_len)
             inst_bitrate_flag = get_bits1(&gb);
         if (dts_flag == 1)
-            dts = get_ts64(&gb, sl->timestamp_len);
+            h->dts = get_ts64(&gb, sl->timestamp_len);
         if (cts_flag == 1)
-            cts = get_ts64(&gb, sl->timestamp_len);
+            h->cts = get_ts64(&gb, sl->timestamp_len);
         if (sl->au_len > 0)
             skip_bits_long(&gb, sl->au_len);
         if (inst_bitrate_flag)
             skip_bits_long(&gb, sl->inst_bitrate_len);
     }
 
-    if (dts != AV_NOPTS_VALUE)
-        pes->dts = dts;
-    if (cts != AV_NOPTS_VALUE)
-        pes->pts = cts;
+    h->au_start = au_start_flag;
+
+    return (get_bits_count(&gb) + 7) >> 3;
+}
+
+static int read_sl_header(PESContext *pes, SLConfigDescr *sl,
+                          const uint8_t *buf, int buf_size)
+{
+    SLHeader h;
+    int ret = parse_sl_header(sl, &h, buf, buf_size);
+
+    /* The SL timestamps replace those of the PES header, which some T-DMB
+     * muxers fill with the object clock reference. A missing decoding time
+     * stamp equals the composition time stamp. */
+    if (h.cts != AV_NOPTS_VALUE) {
+        pes->pts = h.cts;
+        pes->dts = h.dts != AV_NOPTS_VALUE ? h.dts : h.cts;
+    } else if (h.dts != AV_NOPTS_VALUE) {
+        pes->dts = h.dts;
+    }
 
     if (sl->timestamp_len && sl->timestamp_res)
         avpriv_set_pts_info(pes->st, sl->timestamp_len, 1, sl->timestamp_res);
 
-    return (get_bits_count(&gb) + 7) >> 3;
+    return ret;
 }
 
 static AVBufferRef *buffer_pool_get(MpegTSContext *ts, int size)
@@ -1381,8 +1416,14 @@ skip:
                 pes->state = MPEGTS_PAYLOAD;
                 pes->data_index = 0;
                 if (pes->stream_type == STREAM_TYPE_ISO_IEC_14496_PES && buf_size > 0) {
-                    int sl_header_bytes = read_sl_header(pes, &pes->sl, p,
-                                                         buf_size);
+                    int sl_header_bytes;
+                    /* The SL packet header cannot be parsed before the object
+                     * descriptor of the stream arrives. */
+                    if (pes->sl_state == SL_CONFIG_PENDING) {
+                        pes->state = MPEGTS_SKIP;
+                        continue;
+                    }
+                    sl_header_bytes = read_sl_header(pes, &pes->sl, p, buf_size);
                     pes->pes_header_size += sl_header_bytes;
                     p += sl_header_bytes;
                     buf_size -= sl_header_bytes;
@@ -1788,12 +1829,45 @@ static int mp4_read_od(AVFormatContext *s, const uint8_t *buf, unsigned size,
     return ret;
 }
 
+#define MP4ODUpdateTag 0x01 ///< ObjectDescriptorUpdate command
+
+/**
+ * Read the object descriptors of the ObjectDescriptorUpdate commands in an
+ * object descriptor stream access unit (ISO/IEC 14496-1 7.2.5).
+ */
+static void mp4_read_od_commands(AVFormatContext *s, const uint8_t *buf,
+                                 unsigned size, Mp4Descr *descr,
+                                 int *descr_count, int max_descr_count)
+{
+    FFIOContext pb;
+
+    ffio_init_read_context(&pb, buf, size);
+    while (avio_tell(&pb.pub) < size && !avio_feof(&pb.pub)) {
+        int tag, len, count = 0;
+        int64_t start;
+
+        len   = ff_mp4_read_descr(s, &pb.pub, &tag);
+        start = avio_tell(&pb.pub);
+        if (len <= 0 || len > size - start)
+            break;
+        if (tag == MP4ODUpdateTag) {
+            mp4_read_od(s, buf + start, len, descr + *descr_count, &count,
+                        max_descr_count - *descr_count);
+            *descr_count += count;
+        } else {
+            av_log(s, AV_LOG_TRACE, "Skipping object descriptor command %d\n", tag);
+        }
+        avio_seek(&pb.pub, start + len, SEEK_SET);
+    }
+}
+
 static void m4sl_cb(MpegTSFilter *filter, const uint8_t *section,
                     int section_len)
 {
     MpegTSContext *ts = filter->u.section_filter.opaque;
     MpegTSSectionFilter *tssf = &filter->u.section_filter;
     SectionHeader h;
+    SLHeader sl;
     const uint8_t *p, *p_end;
     int mp4_descr_count = 0;
     Mp4Descr mp4_descr[MAX_MP4_DESCR_COUNT] = { { 0 } };
@@ -1809,8 +1883,19 @@ static void m4sl_cb(MpegTSFilter *filter, const uint8_t *section,
     if (skip_identical(&h, tssf))
         return;
 
-    mp4_read_od(s, p, (unsigned) (p_end - p), mp4_descr, &mp4_descr_count,
-                MAX_MP4_DESCR_COUNT);
+    /* The section carries one SL packet with an access unit of the object
+     * descriptor stream. Some T-DMB muxers set the idle flag on packets
+     * with a payload, so rely on the section length instead. */
+    p += parse_sl_header(&tssf->sl, &sl, p, p_end - p);
+    if (p >= p_end)
+        return;
+    if (!sl.au_start) {
+        av_log(s, AV_LOG_DEBUG, "Fragmented object descriptor access unit\n");
+        return;
+    }
+
+    mp4_read_od_commands(s, p, p_end - p, mp4_descr, &mp4_descr_count,
+                         MAX_MP4_DESCR_COUNT);
 
     for (pid = 0; pid < NB_PID_MAX; pid++) {
         if (!ts->pids[pid])
@@ -1832,7 +1917,8 @@ static void m4sl_cb(MpegTSFilter *filter, const uint8_t *section,
                 continue;
             sti = ffstream(st);
 
-            pes->sl = mp4_descr[i].sl;
+            pes->sl       = mp4_descr[i].sl;
+            pes->sl_state = SL_CONFIG_SET;
 
             ffio_init_read_context(&pb, mp4_descr[i].dec_config_descr,
                                    mp4_descr[i].dec_config_descr_len);
@@ -1843,6 +1929,10 @@ static void m4sl_cb(MpegTSFilter *filter, const uint8_t *section,
             if (st->codecpar->codec_id == AV_CODEC_ID_H264 &&
                 st->codecpar->extradata_size > 0)
                 sti->need_parsing = 0;
+            /* The descriptor is authoritative; do not let probing the
+             * packets that arrived before it override the codec. */
+            if (st->codecpar->codec_id != AV_CODEC_ID_NONE)
+                sti->request_probe = 0;
 
             st->codecpar->codec_type = avcodec_get_type(st->codecpar->codec_id);
             sti->need_context_update = 1;
@@ -2107,16 +2197,24 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
             st->disposition |= AV_DISPOSITION_STILL_IMAGE;
         }
         break;
-    case SL_DESCRIPTOR:
+    case SL_DESCRIPTOR: {
+        MpegTSFilter *f = ts ? ts->pids[pid] : NULL;
+        int found = 0, has_od = 0;
+
         desc_es_id = get16(pp, desc_end);
         if (desc_es_id < 0)
             break;
-        if (ts && ts->pids[pid])
-            ts->pids[pid]->es_id = desc_es_id;
-        for (i = 0; i < mp4_descr_count; i++)
+        if (f)
+            f->es_id = desc_es_id;
+        for (i = 0; i < mp4_descr_count; i++) {
+            /* streamType 1: ObjectDescriptorStream */
+            if (mp4_descr[i].dec_config_descr_len >= 2 &&
+                mp4_descr[i].dec_config_descr[1] >> 2 == 1)
+                has_od = 1;
             if (mp4_descr[i].dec_config_descr_len &&
                 mp4_descr[i].es_id == desc_es_id) {
                 FFIOContext pb;
+                found = 1;
                 ffio_init_read_context(&pb, mp4_descr[i].dec_config_descr,
                                        mp4_descr[i].dec_config_descr_len);
                 ff_mp4_read_dec_config_descr(fc, st, &pb.pub);
@@ -2125,10 +2223,32 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
                     sti->need_parsing        = 0;
                     sti->need_context_update = 1;
                 }
-                if (st->codecpar->codec_id == AV_CODEC_ID_MPEG4SYSTEMS)
-                    mpegts_open_section_filter(ts, pid, m4sl_cb, ts, 1);
+                if (f && f->type == MPEGTS_PES) {
+                    PESContext *pes = f->u.pes_filter.opaque;
+                    pes->sl       = mp4_descr[i].sl;
+                    pes->sl_state = SL_CONFIG_SET;
+                }
+                if (st->codecpar->codec_id == AV_CODEC_ID_MPEG4SYSTEMS && ts) {
+                    if (!f)
+                        f = mpegts_open_section_filter(ts, pid, m4sl_cb, ts, 1);
+                    if (f && f->type == MPEGTS_SECTION &&
+                        f->u.section_filter.section_cb == m4sl_cb) {
+                        f->es_id = desc_es_id;
+                        f->u.section_filter.sl = mp4_descr[i].sl;
+                    }
+                }
             }
+        }
+        /* The stream is described in the object descriptor stream, which
+         * also carries the configuration of its SL packet headers. */
+        if (!found && has_od && f && f->type == MPEGTS_PES &&
+            stream_type == STREAM_TYPE_ISO_IEC_14496_PES) {
+            PESContext *pes = f->u.pes_filter.opaque;
+            if (pes->sl_state == SL_CONFIG_UNKNOWN)
+                pes->sl_state = SL_CONFIG_PENDING;
+        }
         break;
+    }
     case FMC_DESCRIPTOR:
         if (get16(pp, desc_end) < 0)
             break;
