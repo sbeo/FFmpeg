@@ -41,6 +41,7 @@
 #include "aacdec.h"
 #include "aacdec_tab.h"
 #include "aacdec_usac.h"
+#include "aacdec_bsac.h"
 
 #include "libavcodec/aac.h"
 #include "libavcodec/aac_defines.h"
@@ -178,7 +179,7 @@ static av_cold int che_configure(AACDecContext *ac,
     return 0;
 }
 
-static int frame_configure_elements(AVCodecContext *avctx)
+static int frame_configure_elements_n(AVCodecContext *avctx, int nb_samples)
 {
     AACDecContext *ac = avctx->priv_data;
     int type, id, ch, ret;
@@ -199,7 +200,7 @@ static int frame_configure_elements(AVCodecContext *avctx)
     if (!avctx->ch_layout.nb_channels)
         return 1;
 
-    ac->frame->nb_samples = 2048;
+    ac->frame->nb_samples = nb_samples;
     if ((ret = ff_get_buffer(avctx, ac->frame, 0)) < 0)
         return ret;
 
@@ -210,6 +211,11 @@ static int frame_configure_elements(AVCodecContext *avctx)
     }
 
     return 0;
+}
+
+static int frame_configure_elements(AVCodecContext *avctx)
+{
+    return frame_configure_elements_n(avctx, 2048);
 }
 
 struct elem_to_channel {
@@ -1013,10 +1019,15 @@ static int decode_ga_specific_config(AACDecContext *ac, AVCodecContext *avctx,
 
     if (extension_flag) {
         switch (m4ac->object_type) {
-        case AOT_ER_BSAC:
-            skip_bits(gb, 5);    // numOfSubFrame
-            skip_bits(gb, 11);   // layer_length
+        case AOT_ER_BSAC: {
+            int num_subframes = get_bits(gb, 5);
+            int layer_length  = get_bits(gb, 11);
+            if (ac) {
+                ac->bsac_num_subframes = num_subframes;
+                ac->bsac_layer_length  = layer_length;
+            }
             break;
+        }
         case AOT_ER_AAC_LC:
         case AOT_ER_AAC_LTP:
         case AOT_ER_AAC_SCALABLE:
@@ -1037,6 +1048,7 @@ static int decode_ga_specific_config(AACDecContext *ac, AVCodecContext *avctx,
     case AOT_ER_AAC_LTP:
     case AOT_ER_AAC_SCALABLE:
     case AOT_ER_AAC_LD:
+    case AOT_ER_BSAC:
         ep_config = get_bits(gb, 2);
         if (ep_config) {
             avpriv_report_missing_feature(avctx,
@@ -1168,6 +1180,22 @@ static int decode_audio_specific_config_gb(AACDecContext *ac,
             return ret;
         break;
 #if CONFIG_AAC_DECODER
+    case AOT_ER_BSAC:
+        if (ac && ac->is_fixed) {
+            avpriv_report_missing_feature(avctx, "ER BSAC fixed-point decoding");
+            return AVERROR_PATCHWELCOME;
+        }
+        if (m4ac->chan_config < 1 || m4ac->chan_config > 2) {
+            avpriv_report_missing_feature(avctx, "ER BSAC channel configuration %d",
+                                          m4ac->chan_config);
+            return AVERROR_PATCHWELCOME;
+        }
+        if (ac && (ret = ff_aac_bsac_init(ac)) < 0)
+            return ret;
+        if ((ret = decode_ga_specific_config(ac, avctx, gb, get_bit_alignment,
+                                             &oc->m4ac, m4ac->chan_config)) < 0)
+            return ret;
+        break;
     case AOT_USAC:
         if ((ret = ff_aac_usac_config_decode(ac, avctx, gb,
                                              oc, m4ac->chan_config)) < 0)
@@ -1220,6 +1248,10 @@ static int decode_audio_specific_config(AACDecContext *ac,
 static av_cold int decode_close(AVCodecContext *avctx)
 {
     AACDecContext *ac = avctx->priv_data;
+
+#if CONFIG_AAC_DECODER
+    ff_aac_bsac_close(ac);
+#endif
 
     for (int i = 0; i < 2; i++) {
         OutputConfiguration *oc = &ac->oc[i];
@@ -2321,6 +2353,65 @@ static int aac_decode_er_frame(AVCodecContext *avctx, AVFrame *frame,
     return 0;
 }
 
+#if CONFIG_AAC_DECODER
+static int aac_decode_bsac_frame(AVCodecContext *avctx, AVFrame *frame,
+                                 int *got_frame_ptr, const uint8_t *buf,
+                                 int buf_size)
+{
+    AACDecContext *ac = avctx->priv_data;
+    const MPEG4AudioConfig *const m4ac = &ac->oc[1].m4ac;
+    const int samples = m4ac->frame_length_short ? 960 : 1024;
+    const int nb_subframes = FFMAX(ac->bsac_num_subframes, 1);
+    const int elem_type = m4ac->chan_config == 2 ? TYPE_CPE : TYPE_SCE;
+    ChannelElement *che;
+    int offset = 0, err;
+
+    if (!ac->bsac)
+        return AVERROR_INVALIDDATA;
+
+    ac->frame = frame;
+    if ((err = frame_configure_elements_n(avctx, samples * nb_subframes)) < 0)
+        return err;
+
+    ac->avctx->profile = AOT_ER_BSAC - 1;
+    ac->tags_mapped = 0;
+
+    if (!(che = ff_aac_get_che(ac, elem_type, 0))) {
+        av_log(avctx, AV_LOG_ERROR, "channel element %d.0 is not allocated\n",
+               elem_type);
+        return AVERROR_INVALIDDATA;
+    }
+
+    for (int sub = 0; sub < nb_subframes; sub++) {
+        err = ff_aac_bsac_decode_frame(ac, che, buf + offset, buf_size - offset);
+        if (err < 0)
+            return err;
+        offset += err;
+
+        if (frame->data[0]) {
+            for (int ch = 0; ch < avctx->ch_layout.nb_channels; ch++)
+                if (ac->output_element[ch])
+                    ac->output_element[ch]->output =
+                        (float *)frame->extended_data[ch] + sub * samples;
+        }
+        che->present = 1;
+        spectral_to_sample(ac, samples);
+    }
+
+    if (!frame->data[0]) {
+        av_log(avctx, AV_LOG_ERROR, "no frame data found\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    frame->nb_samples  = samples * nb_subframes;
+    frame->sample_rate = avctx->sample_rate;
+    frame->flags      |= AV_FRAME_FLAG_KEY;
+    *got_frame_ptr = 1;
+
+    return 0;
+}
+#endif
+
 static int decode_frame_ga(AVCodecContext *avctx, AACDecContext *ac,
                            GetBitContext *gb, int *got_frame_ptr)
 {
@@ -2607,6 +2698,11 @@ static int aac_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     case AOT_ER_AAC_ELD:
         err = aac_decode_er_frame(avctx, frame, got_frame_ptr, &gb);
         break;
+#if CONFIG_AAC_DECODER
+    case AOT_ER_BSAC:
+        err = aac_decode_bsac_frame(avctx, frame, got_frame_ptr, buf, buf_size);
+        return err < 0 ? err : buf_size;
+#endif
     default:
         err = aac_decode_frame_int(avctx, frame, got_frame_ptr, &gb, avpkt);
     }

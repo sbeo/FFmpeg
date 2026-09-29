@@ -118,6 +118,18 @@ bsac_raw_data_block
 | E11 | 4.5.2.6.2.7 | `decode_symbol2(buf_idx, freq0, …)` 선언과 본문 `p0` 불일치, `p1 = 16384 – p0`인데 p0 표기는 "6-bit, 상위 6비트만 유효" | 14비트 스케일(16384=1.0)로 통일해서 사용 |
 | E12 | 4.6.4.3 | `ms_mask_present==3`, `stereo_info==3`, 두 noise flag가 0 → out-of-phase IS. `sfb < pns_start_sfb`일 때 noise flag 자체를 읽지 않음 | 구문표(Table 4.39)를 기준으로 구현 |
 | E13 | 4.5.2.6.2.5 `available_len` | "산술부호가 레이어 시작에서 초기화되었으면 1을 뺀다" — SBA에서 segment 시작 레이어에만 해당 | SBA가 아니면 layer 0에만 적용 |
+| E14 | 4.5.2.6.2.5 `layer_end_sfb` | `if (layer_end_index <= swb_offset[sfb]) layer_end_sfb = sfb + 1` | **샘플로 확인: `+ 1`이 오류.** 레이어 끝 이후에서 시작하는 band는 포함하지 않음 (`layer_end_sfb = sfb`). `+ 1`이면 레이어 0의 scf 심볼 수가 어긋나 c0부터 깨짐 |
+| E15 | Table 4.39 vs 4.B.17.5 | 규범 구문은 모든 sfb에 `acode_scf_index`를 두지만, 정보성 부록은 "값이 모두 0인 sfb의 scalefactor는 전송하지 않는다", "첫 scf만 max 기준, 나머지는 직전 scf 기준 차분"이라고 기술 | 샘플로 검증 중 |
+
+### 3.1 T-DMB 샘플(KBS)로 확인한 사실
+
+- AOT 22, 44.1 kHz, 스테레오, `numOfSubFrame`=1, `layer_length`=1792, `epConfig`=0
+- 모든 프레임: `frame_length`=151 바이트 = 패킷 크기, `top_layer`=10, `sba_mode`=0, `base_snf_thr`=0,
+  `base_band`=10, ONLY_LONG, `max_sfb`=33, PNS 없음, LTP 없음, `ms_mask_present` ∈ {0,1,2}, 일부 프레임 TNS
+- `header_length + 7` = 실제 헤더 바이트 수 (TNS 파싱 포함 헤더 해석 검증됨)
+- 검증 지표
+  1. 각 coding band의 MSB plane에는 1이 적어도 하나 있어야 함 (`cband_si`가 가리키는 MSB와 실제 최댓값 비교)
+  2. 각 `cband_si` 심볼 비용 ≤ `max_cband_si_len`(0번 band는 11), 각 sfb side info 비용 ≤ `max_sfb_si_len + 5`
 
 ---
 

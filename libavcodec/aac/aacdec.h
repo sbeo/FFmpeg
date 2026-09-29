@@ -590,6 +590,15 @@ struct AACDecContext {
     int warned_he_aac_mono;
 
     int is_fixed;
+
+    /**
+     * @name ER BSAC
+     * @{
+     */
+    struct BSACContext *bsac;
+    int bsac_num_subframes;   ///< numOfSubFrame
+    int bsac_layer_length;    ///< layer_length
+    /** @} */
 };
 
 #if defined(USE_FIXED) && USE_FIXED
